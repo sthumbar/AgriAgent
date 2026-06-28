@@ -121,6 +121,33 @@ st.markdown(
     /* ── Confidence bar ── */
     .conf-bar-bg { background: #E8F5E9; border-radius: 8px; height: 12px; }
     .conf-bar-fill { background: linear-gradient(90deg, #388E3C, #66BB6A); border-radius: 8px; height: 12px; }
+
+    /* ── Review / HITL ── */
+    .review-card {
+        background: #FFF8E1;
+        border: 2px solid #FFB300;
+        border-radius: 12px;
+        padding: 1.5rem;
+        margin: 1rem 0;
+    }
+    .review-card h3 { color: #E65100; margin: 0 0 0.5rem; }
+    .review-id-chip {
+        display: inline-block;
+        background: #FF8F00;
+        color: white;
+        font-family: monospace;
+        font-size: 0.9rem;
+        font-weight: 700;
+        padding: 0.2rem 0.8rem;
+        border-radius: 20px;
+    }
+    .approved-card {
+        background: #E8F5E9;
+        border: 2px solid #388E3C;
+        border-radius: 12px;
+        padding: 1rem 1.5rem;
+        margin: 1rem 0;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -173,6 +200,170 @@ def _save_uploaded_file(uploaded_file) -> str:
     )
 
 
+# ── HITL: Flagged-for-review panel ───────────────────────────────────────────
+
+def render_review_flagged(result: dict) -> None:
+    """Shown in the right column when vision confidence is too low."""
+    review_id = result.get("review_id", "???")
+    vision = result.get("vision_result", {})
+    confidence = int(vision.get("confidence", 0))
+
+    st.markdown(
+        f"""
+        <div class="review-card">
+            <h3>⚠️ Low Confidence — Queued for Agronomist Review</h3>
+            <p>AI confidence is <strong>{confidence}%</strong>, which is below the required threshold.
+            The analysis has been submitted to the review queue.</p>
+            <p>Review ID: <span class="review-id-chip">{review_id}</span></p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Crop (AI guess)", vision.get("crop", "Unknown"))
+    c2.metric("Disease (AI guess)", vision.get("disease", "Unknown"))
+    c3.metric("Confidence", f"{confidence}%")
+
+    st.info(
+        "An agronomist can review and approve this case from the "
+        "**Agronomist Dashboard** in the sidebar. "
+        "Once approved the full report will be generated automatically."
+    )
+
+
+# ── HITL: Agronomist Dashboard ────────────────────────────────────────────────
+
+def render_agronomist_dashboard() -> None:
+    """Full-page agronomist review dashboard."""
+    from tools.review_tool import (
+        list_pending_reviews, list_all_reviews,
+        add_expert_note, get_full_analysis,
+    )
+
+    st.markdown("## 👨‍🌾 Agronomist Review Dashboard")
+    st.caption("Review low-confidence AI diagnoses, correct them if needed, and approve to generate the report.")
+
+    tab_pending, tab_history = st.tabs(["🔔 Pending Reviews", "📋 All Reviews"])
+
+    with tab_pending:
+        pending = list_pending_reviews()
+        if not pending:
+            st.success("No pending reviews. All clear!")
+        else:
+            st.warning(f"{len(pending)} case(s) awaiting review")
+            for review in pending:
+                with st.expander(
+                    f"[{review['id']}] {review['crop']} — {review['disease']} "
+                    f"| Confidence: {review['confidence']}% | {review['submitted_at'][:16]}"
+                ):
+                    col_a, col_b, col_c = st.columns(3)
+                    col_a.metric("AI Crop", review["crop"])
+                    col_b.metric("AI Disease", review["disease"])
+                    col_c.metric("Confidence", f"{review['confidence']}%")
+
+                    st.caption(f"Image: `{review['image_path']}`")
+                    st.caption(f"Submitted: {review['submitted_at']}")
+
+                    st.markdown("**Corrections (optional)**")
+                    corrected_crop = st.text_input(
+                        "Corrected Crop", value=review["crop"],
+                        key=f"crop_{review['id']}"
+                    )
+                    corrected_disease = st.text_input(
+                        "Corrected Disease", value=review["disease"],
+                        key=f"disease_{review['id']}"
+                    )
+                    expert_note = st.text_area(
+                        "Expert Note *",
+                        placeholder="Describe your observations and reasoning...",
+                        key=f"note_{review['id']}"
+                    )
+                    reviewer_name = st.text_input(
+                        "Your Name / ID", value="Dr. Agronomist",
+                        key=f"reviewer_{review['id']}"
+                    )
+
+                    col_approve, col_reject, col_info = st.columns(3)
+
+                    if col_approve.button("✅ Approve & Generate Report", key=f"approve_{review['id']}", type="primary"):
+                        if not expert_note.strip():
+                            st.error("Please add an expert note before approving.")
+                        else:
+                            add_expert_note(
+                                review_id=review["id"],
+                                note=expert_note,
+                                action="approved",
+                                reviewer=reviewer_name,
+                                corrected_crop=corrected_crop if corrected_crop != review["crop"] else "",
+                                corrected_disease=corrected_disease if corrected_disease != review["disease"] else "",
+                            )
+
+                            # Resume pipeline with (possibly corrected) vision result
+                            analysis = get_full_analysis(review["id"])
+                            vision_result = analysis.get("vision_result", {})
+
+                            with st.spinner("Generating recommendations and report..."):
+                                def _progress(msg, pct):
+                                    st.caption(f"{pct}% — {msg}")
+
+                                from agents.orchestrator import OrchestratorAgent
+                                orchestrator = OrchestratorAgent()
+                                final_result = orchestrator.run_from_vision_result_sync(
+                                    vision_result=vision_result,
+                                    image_path=review["image_path"],
+                                )
+
+                            if final_result.get("success"):
+                                st.success(f"Report generated for review {review['id']}!")
+                                st.session_state.result = final_result
+                                st.session_state.page = "main"
+                                st.rerun()
+                            else:
+                                st.error(f"Pipeline error: {final_result.get('error')}")
+
+                    if col_reject.button("❌ Reject", key=f"reject_{review['id']}"):
+                        if not expert_note.strip():
+                            st.error("Please add a reason before rejecting.")
+                        else:
+                            add_expert_note(
+                                review_id=review["id"],
+                                note=expert_note,
+                                action="rejected",
+                                reviewer=reviewer_name,
+                            )
+                            st.warning(f"Review {review['id']} rejected.")
+                            st.rerun()
+
+                    if col_info.button("🔁 Needs More Info", key=f"info_{review['id']}"):
+                        if not expert_note.strip():
+                            st.error("Please add what info is needed.")
+                        else:
+                            add_expert_note(
+                                review_id=review["id"],
+                                note=expert_note,
+                                action="needs_more_info",
+                                reviewer=reviewer_name,
+                            )
+                            st.info(f"Review {review['id']} marked as needing more info.")
+                            st.rerun()
+
+    with tab_history:
+        all_reviews = list_all_reviews()
+        if not all_reviews:
+            st.info("No reviews yet.")
+        else:
+            status_icon = {"pending": "🟡", "approved": "✅", "rejected": "❌", "needs_more_info": "🔵"}
+            for r in all_reviews:
+                icon = status_icon.get(r["status"], "⚪")
+                st.markdown(
+                    f"{icon} **[{r['id']}]** {r['crop']} — {r['disease']} "
+                    f"| {r['confidence']}% | _{r['status']}_ | {r['submitted_at'][:16]}"
+                )
+                if r.get("expert_note"):
+                    st.caption(f"   Expert note: {r['expert_note']}")
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 
 def render_sidebar() -> None:
@@ -208,6 +399,20 @@ def render_sidebar() -> None:
         st.markdown("---")
         st.markdown("**Supported crops**")
         st.markdown("Tomato · Wheat · Rice · Maize · Cotton · Potato · and more")
+        st.markdown("---")
+
+        # ── Agronomist Dashboard link ─────────────────────────────────────
+        from tools.review_tool import list_pending_reviews
+        pending_count = len(list_pending_reviews())
+        badge = f" ({pending_count})" if pending_count else ""
+        if st.button(f"👨‍🌾 Agronomist Dashboard{badge}", use_container_width=True):
+            st.session_state.page = "dashboard"
+            st.rerun()
+        if st.session_state.get("page") == "dashboard":
+            if st.button("← Back to Analysis", use_container_width=True):
+                st.session_state.page = "main"
+                st.rerun()
+
         st.markdown("---")
         st.caption("Powered by Google ADK · Gemini 2.5 Flash · ChromaDB")
 
@@ -393,6 +598,12 @@ def render_results(result: dict) -> None:
 # ── Main app ──────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    # Dashboard page takes over the whole content area
+    if st.session_state.get("page") == "dashboard":
+        render_sidebar()
+        render_agronomist_dashboard()
+        return
+
     render_sidebar()
 
     # ── Header ───────────────────────────────────────────────────────────────
@@ -438,7 +649,11 @@ def main() -> None:
 
     with right_col:
         if "result" in st.session_state and st.session_state.result:
-            render_results(st.session_state.result)
+            r = st.session_state.result
+            if r.get("requires_review"):
+                render_review_flagged(r)
+            else:
+                render_results(r)
         elif not uploaded_file:
             st.markdown("#### How to use")
             steps = [
@@ -496,7 +711,10 @@ def main() -> None:
     # ── Reset button ──────────────────────────────────────────────────────────
     if "result" in st.session_state and st.session_state.result:
         with left_col:
-            if st.button("🔄 Analyse Another Image", use_container_width=True):
+            label = "🔄 Analyse Another Image"
+            if st.session_state.result.get("requires_review"):
+                label = "🔄 Upload Different Image"
+            if st.button(label, use_container_width=True):
                 del st.session_state["result"]
                 st.rerun()
 

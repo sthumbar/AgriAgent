@@ -21,7 +21,7 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 import chromadb
 from chromadb.config import Settings
-from langchain.schema import Document
+from langchain_core.documents import Document
 from langchain_community.document_loaders import (
     DirectoryLoader,
     TextLoader,
@@ -119,7 +119,7 @@ def get_embeddings() -> GoogleGenerativeAIEmbeddings:
         raise EnvironmentError("GOOGLE_API_KEY environment variable is not set.")
 
     return GoogleGenerativeAIEmbeddings(
-        model="models/embedding-001",
+        model="models/gemini-embedding-001",
         google_api_key=api_key,
         task_type="retrieval_document",
     )

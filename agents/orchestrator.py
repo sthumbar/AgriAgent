@@ -17,6 +17,7 @@ from agents.vision_agent import VisionAgent, analyze_crop_image
 from agents.recommendation_agent import RecommendationAgent, get_crop_recommendations
 from agents.report_agent import ReportAgent, create_report_files
 from tools.rag_tool import retrieve_agricultural_knowledge
+from tools.review_tool import is_low_confidence, submit_for_review
 
 logger = logging.getLogger(__name__)
 
@@ -144,7 +145,27 @@ class OrchestratorAgent:
 
             crop_name: str = vision_result.get("crop", "Unknown")
             disease_name: str = vision_result.get("disease", "Unknown")
-            logger.info("Vision: crop=%s, disease=%s", crop_name, disease_name)
+            confidence: int = int(vision_result.get("confidence", 100))
+            logger.info("Vision: crop=%s, disease=%s, confidence=%d%%", crop_name, disease_name, confidence)
+
+            # ── HITL Gate: low-confidence → queue for agronomist review ──────
+            if is_low_confidence(confidence):
+                review_id = submit_for_review(image_path, {"vision_result": vision_result})
+                logger.warning(
+                    "Low confidence (%d%%) — flagged for agronomist review (id=%s)",
+                    confidence, review_id,
+                )
+                result.update({
+                    "success": False,
+                    "requires_review": True,
+                    "review_id": review_id,
+                    "review_message": (
+                        f"AI confidence is {confidence}% (threshold: "
+                        f"{os.getenv('LOW_CONFIDENCE_THRESHOLD', '60')}%). "
+                        "Analysis queued for agronomist review before recommendations are generated."
+                    ),
+                })
+                return result
 
             # ── Step 2: RAG Retrieval ────────────────────────────────────────
             logger.info("Pipeline step 2/3: RAG retrieval + recommendations")
@@ -192,6 +213,67 @@ class OrchestratorAgent:
 
         return result
 
+    # ── Post-approval resume ─────────────────────────────────────────────────
+
+    async def run_from_vision_result(
+        self,
+        vision_result: Dict[str, Any],
+        image_path: str = "",
+        progress_callback=None,
+    ) -> Dict[str, Any]:
+        """
+        Resume the pipeline from an already-confirmed vision result.
+        Called after an agronomist approves a low-confidence review.
+        Skips vision; runs RAG → Recommendations → Report.
+        """
+        start_time = datetime.now()
+        result: Dict[str, Any] = {
+            "image_path": image_path,
+            "timestamp": start_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "vision_result": vision_result,
+            "success": False,
+            "error": None,
+        }
+
+        try:
+            crop_name = vision_result.get("crop", "Unknown")
+            disease_name = vision_result.get("disease", "Unknown")
+
+            if progress_callback:
+                progress_callback("Retrieving agricultural knowledge (RAG)...", 30)
+
+            rag_query = f"{crop_name} {disease_name} treatment fertilizer irrigation management"
+            from tools.rag_tool import get_retriever
+            rag_context = get_retriever().retrieve_as_context(rag_query)
+            result["rag_context"] = rag_context
+
+            if progress_callback:
+                progress_callback("Generating recommendations...", 60)
+
+            recommendations = await self._recommendation_agent.run(crop_name, disease_name)
+            result["recommendations"] = recommendations
+
+            if progress_callback:
+                progress_callback("Generating PDF report...", 85)
+
+            report_result = await self._report_agent.run({
+                "vision_result": vision_result,
+                "recommendations": recommendations,
+                "rag_context": rag_context,
+            })
+            result.update(report_result)
+            result["success"] = True
+            result["elapsed_seconds"] = round((datetime.now() - start_time).total_seconds(), 1)
+
+            if progress_callback:
+                progress_callback("Analysis complete!", 100)
+
+        except Exception as exc:
+            logger.error("Post-approval pipeline failed: %s", exc, exc_info=True)
+            result["error"] = str(exc)
+
+        return result
+
     # ── Synchronous wrapper ──────────────────────────────────────────────────
 
     def run_sync(
@@ -216,3 +298,29 @@ class OrchestratorAgent:
                 return loop.run_until_complete(self.run(image_path, progress_callback))
         except RuntimeError:
             return asyncio.run(self.run(image_path, progress_callback))
+
+    def run_from_vision_result_sync(
+        self,
+        vision_result: Dict[str, Any],
+        image_path: str = "",
+        progress_callback=None,
+    ) -> Dict[str, Any]:
+        """Synchronous wrapper around run_from_vision_result() for Streamlit."""
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(
+                        asyncio.run,
+                        self.run_from_vision_result(vision_result, image_path, progress_callback),
+                    )
+                    return future.result()
+            else:
+                return loop.run_until_complete(
+                    self.run_from_vision_result(vision_result, image_path, progress_callback)
+                )
+        except RuntimeError:
+            return asyncio.run(
+                self.run_from_vision_result(vision_result, image_path, progress_callback)
+            )
