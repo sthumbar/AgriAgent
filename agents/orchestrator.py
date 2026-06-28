@@ -60,7 +60,7 @@ The final response must be a valid JSON object containing:
 
     return Agent(
         name="agri_orchestrator",
-        model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+        model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"),
         description=(
             "Top-level coordinator for the Agri AI analysis pipeline. "
             "Directs Vision, Recommendation, and Report agents in sequence to produce "

@@ -414,6 +414,19 @@ def render_sidebar() -> None:
                 st.rerun()
 
         st.markdown("---")
+
+        # ── Audio language selector ───────────────────────────────────────
+        from tools.audio_tool import SUPPORTED_LANGUAGES
+        st.markdown("**Audio Language**")
+        st.session_state.audio_language = st.selectbox(
+            "Language for spoken summary",
+            options=list(SUPPORTED_LANGUAGES.keys()),
+            index=0,
+            label_visibility="collapsed",
+            help="Choose the language for the spoken crop report",
+        )
+
+        st.markdown("---")
         st.caption("Powered by Google ADK · Gemini 2.5 Flash · ChromaDB")
 
 
@@ -551,6 +564,29 @@ def render_results(result: dict) -> None:
                 "*The following information was retrieved from the knowledge base and informed this analysis:*"
             )
             st.markdown(rag_context)
+
+    # ── Audio summary ─────────────────────────────────────────────────────────
+    _section("Listen to Summary")
+    st.caption("Farmer-friendly spoken summary — helpful for low-literacy users")
+
+    audio_language = st.session_state.get("audio_language", "English")
+    audio_col, _ = st.columns([1, 2])
+    with audio_col:
+        if st.button(f"🔊 Play in {audio_language}", key="play_audio", use_container_width=True):
+            with st.spinner("Generating audio..."):
+                from tools.audio_tool import generate_audio_bytes
+                audio_bytes = generate_audio_bytes(result, audio_language)
+            if audio_bytes:
+                st.audio(audio_bytes, format="audio/mp3")
+                st.download_button(
+                    label="⬇️ Download Audio",
+                    data=audio_bytes,
+                    file_name=f"crop_report_{audio_language.split()[0].lower()}.mp3",
+                    mime="audio/mpeg",
+                    key="download_audio",
+                )
+            else:
+                st.error("Audio generation failed. Please check your internet connection.")
 
     # ── Download section ──────────────────────────────────────────────────────
     _section("Download Reports")
